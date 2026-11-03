@@ -1,6 +1,7 @@
 # Python 缓存与构建产物
 __pycache__/
 *.pyc
+*.bak*
 build/
 dist/
 *.spec

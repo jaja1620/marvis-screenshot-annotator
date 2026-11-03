@@ -3,13 +3,16 @@
 Marvis 截图助手 (常驻 GUI 版)
 - 常驻主面板：启动后立即显示，不自动进入截图；关闭窗口或点"退出"即退出程序
 - 全局快捷键触发截图（默认 Ctrl+Shift+M，可修改；keyboard 注册失败降级 pynput）
-- 截图流程：隐藏主窗口 -> 全屏截图 -> 鼠标框选标注(矩形/椭圆/箭头/画笔/文字/马赛克/撤销/颜色/粗细)
+- 多屏幕支持：全屏截图覆盖所有显示器的虚拟桌面（win32api.EnumDisplayMonitors 计算 bbox），
+  遮罩窗口覆盖整个虚拟桌面（含负坐标），canvas 坐标与图像坐标一一对应
+- 截图流程：隐藏主窗口 -> 多屏全屏截图 -> 鼠标框选标注(矩形/椭圆/箭头/画笔/文字/马赛克/撤销/重选/颜色/粗细)
+  确认前可反复点击"重选"重新框选（基于原始全屏图像，不重新截图）
 - 确认后：自动生成简要名称(图0001/图0002...递增) -> 主图存 screenshots\图NNNN.png
   -> 副本存 当前副本目录(默认 MARVIS沟通截图，可在 GUI 自定义并持久化到 config.json)
-  -> 复制到剪贴板 -> 恢复主窗口并提示
-- 主面板：最近截图、连接 Marvis、副本目录设置、历史截图列表(副本文件夹)、点击预览大图、复制名称
+  -> 复制到剪贴板 -> 自动粘贴到 Marvis 输入框（可开关）-> 恢复主窗口并提示
+- 主面板：最近截图、连接 Marvis、自动粘贴开关、副本目录设置、历史截图列表(副本文件夹)、点击预览大图、复制名称
 - 连接 Marvis：显示副本目录绝对路径 + 使用说明（对 Marvis 说"我的截图副本目录是：<路径>"）
-依赖: pillow, pywin32, keyboard (pynput 可选, 由启动脚本自动安装)
+依赖: pillow, pywin32(win32clipboard/win32gui/win32api), keyboard (pynput 可选, 由启动脚本自动安装)
 """
 
 import io
@@ -28,6 +31,21 @@ try:
     import win32clipboard
 except ImportError:
     win32clipboard = None
+
+try:
+    import win32gui
+except ImportError:
+    win32gui = None
+
+try:
+    import win32api
+except ImportError:
+    win32api = None
+
+try:
+    import win32process
+except ImportError:
+    win32process = None
 
 try:
     import keyboard
@@ -105,24 +123,64 @@ def copy_image_to_clipboard(img):
         return False
 
 
+# ---------------- 多屏虚拟桌面 ----------------
+def get_virtual_screen_bbox():
+    """返回虚拟桌面 bbox (left, top, right, bottom)，覆盖所有显示器，坐标可为负。
+    优先 win32api.EnumDisplayMonitors，失败回退主屏尺寸。"""
+    if win32api is not None:
+        try:
+            monitors = win32api.EnumDisplayMonitors(None, None)
+            if monitors:
+                lefts = [m[2][0] for m in monitors]
+                tops = [m[2][1] for m in monitors]
+                rights = [m[2][2] for m in monitors]
+                bottoms = [m[2][3] for m in monitors]
+                bbox = (min(lefts), min(tops), max(rights), max(bottoms))
+                if bbox[2] > bbox[0] and bbox[3] > bbox[1]:
+                    return bbox
+        except Exception:
+            pass
+    try:
+        w, h = ImageGrab.grab().size
+        return (0, 0, w, h)
+    except Exception:
+        return (0, 0, 1920, 1080)
+
+
+def image_to_screen(bbox, x, y):
+    """图像坐标 -> 虚拟屏幕坐标（多屏负坐标偏移）"""
+    return (bbox[0] + x, bbox[1] + y)
+
+
+def screen_to_image(bbox, sx, sy):
+    """虚拟屏幕坐标 -> 图像坐标"""
+    return (sx - bbox[0], sy - bbox[1])
+
+
 # ---------------- 配置读写 ----------------
 def load_config():
-    """读取 config.json，返回副本目录；缺失或损坏时返回默认目录"""
+    """读取 config.json，返回 (副本目录, 自动粘贴开关)；缺失或损坏时返回默认值"""
+    copy_dir = DEFAULT_COPY_DIR
+    auto_paste = True
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        if isinstance(cfg, dict) and isinstance(cfg.get("copy_dir"), str) and cfg["copy_dir"].strip():
-            return cfg["copy_dir"].strip()
+        if isinstance(cfg, dict):
+            if isinstance(cfg.get("copy_dir"), str) and cfg["copy_dir"].strip():
+                copy_dir = cfg["copy_dir"].strip()
+            if isinstance(cfg.get("auto_paste"), bool):
+                auto_paste = cfg["auto_paste"]
     except Exception:
         pass
-    return DEFAULT_COPY_DIR
+    return copy_dir, auto_paste
 
 
-def save_config(copy_dir):
-    """持久化副本目录到 config.json，返回是否成功"""
+def save_config(copy_dir, auto_paste=True):
+    """持久化副本目录与自动粘贴开关到 config.json，返回是否成功"""
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump({"copy_dir": copy_dir}, f, ensure_ascii=False, indent=2)
+            json.dump({"copy_dir": copy_dir, "auto_paste": auto_paste}, f,
+                      ensure_ascii=False, indent=2)
         return True
     except Exception:
         return False
@@ -160,18 +218,110 @@ def save_screenshot(img, copy_dir):
     return name, main_path, copy_path, copied
 
 
+# ---------------- Marvis 窗口查找与自动粘贴 ----------------
+def find_marvis_windows():
+    """查找标题含 Marvis 的可见主窗口，排除本程序窗口，返回 [(hwnd, title)]，按可用性排序"""
+    if win32gui is None:
+        return []
+    result = []
+
+    def cb(hwnd, _):
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            title = win32gui.GetWindowText(hwnd) or ""
+            if "Marvis" not in title:
+                return
+            if title == APP_TITLE:
+                return
+            # 排除辅助/隐藏类窗口
+            if any(tag in title for tag in ("ShadowCompanion", "GDI+ Window", "Background", "ToolTip", "Notification")):
+                return
+            if win32process is not None:
+                try:
+                    if win32process.GetWindowThreadProcessId(hwnd)[1] == os.getpid():
+                        return
+                except Exception:
+                    pass
+            result.append((hwnd, title))
+        except Exception:
+            pass
+
+    try:
+        win32gui.EnumWindows(cb, None)
+    except Exception:
+        return []
+
+    def sort_key(item):
+        hwnd = item[0]
+        minimized = 1
+        area = 0
+        exact = 0
+        title = item[1]
+        if title.strip().lower() == "marvis":
+            exact = 1
+        try:
+            if not win32gui.IsIconic(hwnd):
+                minimized = 0
+            l, t, r, b = win32gui.GetWindowRect(hwnd)
+            area = max(0, (r - l) * (b - t))
+        except Exception:
+            pass
+        return (-exact, minimized, -area)
+
+    result.sort(key=sort_key)
+    return result
+
+
+def paste_to_marvis():
+    """查找 Marvis 窗口并激活，模拟 Ctrl+V 粘贴图片。
+    返回 (是否成功, 提示文本)。优先 keyboard.send，失败降级 win32api.keybd_event。"""
+    if win32gui is None:
+        return False, "缺少 win32gui（pywin32），无法自动粘贴"
+    wins = find_marvis_windows()
+    if not wins:
+        return False, "未找到 Marvis 窗口"
+    hwnd = wins[0][0]
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+        time.sleep(0.35)
+        sent = False
+        if keyboard is not None:
+            try:
+                keyboard.send("ctrl+v")
+                sent = True
+            except Exception:
+                sent = False
+        if not sent and win32api is not None:
+            win32api.keybd_event(0x11, 0, 0, 0)   # Ctrl down
+            win32api.keybd_event(0x56, 0, 0, 0)   # V down
+            win32api.keybd_event(0x56, 0, 2, 0)   # V up
+            win32api.keybd_event(0x11, 0, 2, 0)   # Ctrl up
+            sent = True
+        if not sent:
+            return False, "缺少 keyboard/win32api，无法模拟 Ctrl+V"
+        time.sleep(0.15)
+        return True, "已自动粘贴到 Marvis 输入框，请按回车确认发送"
+    except Exception as exc:
+        return False, "自动粘贴失败: %s" % exc
+
+
 # ---------------- 截图标注窗口 ----------------
 class CaptureWindow(tk.Toplevel):
-    """全屏截图 + 框选 + 标注。确认/取消时通过 on_result 回调 (PIL 图 or None)"""
+    """全屏截图 + 框选 + 标注。确认/取消时通过 on_result 回调 (PIL 图 or None)。
+    支持多屏虚拟桌面：遮罩覆盖 bbox 范围（含负坐标），canvas 坐标与图像坐标一致，
+    因此框选/标注坐标可直接用于图像渲染，无需换算。"""
 
-    def __init__(self, parent, img, on_result):
+    def __init__(self, parent, img, bbox, on_result):
         super().__init__(parent)
         self.on_result = on_result
         self.img = img.convert("RGB")
-        self.screen_w = self.winfo_screenwidth()
-        self.screen_h = self.winfo_screenheight()
+        self.bbox = bbox
+        self.vw = bbox[2] - bbox[0]
+        self.vh = bbox[3] - bbox[1]
         self.title("截图标注")
-        self.attributes("-fullscreen", True)
+        self.overrideredirect(True)
+        self.geometry("%dx%d+%d+%d" % (self.vw, self.vh, bbox[0], bbox[1]))
         self.attributes("-topmost", True)
         self.focus_force()
 
@@ -187,11 +337,14 @@ class CaptureWindow(tk.Toplevel):
         self.elements = []
         self.temp_id = None
         self.toolbar = None
+        self.hint_id = None
 
         self.tool = TOOL_RECT
         self.color = "#FF0000"
         self.width = 3
         self.pen_points = []
+
+        self._show_hint("请框选截图区域（可反复重选）")
 
         self.bind("<Button-1>", self.on_press)
         self.bind("<B1-Motion>", self.on_drag)
@@ -199,11 +352,31 @@ class CaptureWindow(tk.Toplevel):
         self.bind("<Escape>", lambda e: self.cancel())
         self.bind("<Return>", lambda e: self.confirm())
 
+    def _show_hint(self, text):
+        try:
+            self._remove_hint()
+            self.hint_id = self.canvas.create_text(
+                self.vw // 2, 24, text=text, fill="#ffffff",
+                font=("Microsoft YaHei UI", 16, "bold"),
+                outline="#000000", width=self.vw - 40,
+            )
+        except Exception:
+            pass
+
+    def _remove_hint(self):
+        if self.hint_id is not None:
+            try:
+                self.canvas.delete(self.hint_id)
+            except Exception:
+                pass
+            self.hint_id = None
+
     # ---------- 鼠标事件 ----------
     def on_press(self, e):
         if self.state == "select":
             self.start = (e.x, e.y)
             self.cur = (e.x, e.y)
+            self._remove_hint()
             return
         if self.tool == TOOL_TEXT:
             self.add_text(e.x, e.y)
@@ -400,16 +573,36 @@ class CaptureWindow(tk.Toplevel):
 
         tk.Frame(bar, width=6, bg="#2b2b2b").pack(side="left")
         tk.Button(bar, text="撤销", command=self.undo, relief="flat", bg="#4a4a4a", fg="white").pack(side="left", padx=2)
+        tk.Button(bar, text="重选", command=self.reselect, relief="flat", bg="#f0a500", fg="white", width=5).pack(side="left", padx=2)
         tk.Button(bar, text="确认", command=self.confirm, relief="flat", bg="#1a8cff", fg="white", width=6).pack(side="left", padx=4)
         tk.Button(bar, text="取消", command=self.cancel, relief="flat", bg="#c9302c", fg="white", width=6).pack(side="left", padx=2)
 
         self.update_idletasks()
         th = bar.winfo_reqheight()
-        ty = y2 + 10 if y2 + 10 + th <= self.screen_h else max(0, y1 - th - 10)
-        tx = max(4, min(x1, self.screen_w - bar.winfo_reqwidth() - 4))
+        ty = y2 + 10 if y2 + 10 + th <= self.vh else max(0, y1 - th - 10)
+        tx = max(4, min(x1, self.vw - bar.winfo_reqwidth() - 4))
         bar.place(x=tx, y=ty)
         self.toolbar = bar
         self.update_tool_buttons()
+
+    # ---------- 重选区域 ----------
+    def reselect(self):
+        """清除当前选区与全部标注，回到框选模式（基于保留的原始全屏图像，不重新截图）"""
+        try:
+            self.elements = []
+            self.region = None
+            self.state = "select"
+            self.start = None
+            self.cur = None
+            self.pen_points = []
+            if self.toolbar is not None:
+                self.toolbar.destroy()
+                self.toolbar = None
+            self._remove_temp()
+            self.redraw_overlay()
+            self._show_hint("请重新框选截图区域（可反复重选）")
+        except Exception as exc:
+            messagebox.showerror("错误", "重新选择区域失败: %s" % exc, parent=self)
 
     def set_tool(self, tool):
         self.tool = tool
@@ -578,8 +771,8 @@ class ConnectWindow:
             "   我的截图副本目录是：<路径>\n\n"
             "2. Marvis 记住该目录后，即可通过「查看图XXXX」\n"
             "   直接从该目录读取你的截图。\n\n"
-            "3. 每次截图确认后，也可对 Marvis 说「查看图XXXX」\n"
-            "   或在输入框按 Ctrl+V 粘贴。"
+            "3. 每次截图确认后，程序会自动粘贴到 Marvis 输入框\n"
+            "   （也可对 Marvis 说「查看图XXXX」或按 Ctrl+V 粘贴）。"
         )
         tk.Label(box, text=tips, justify="left", anchor="w", fg="#333333").pack(anchor="w", pady=(2, 10))
 
@@ -590,15 +783,16 @@ class ConnectWindow:
 
 # ---------------- 常驻主面板 ----------------
 class MainApp:
-    def __init__(self, copy_dir):
+    def __init__(self, copy_dir, auto_paste=True):
         self.copy_dir = copy_dir
+        self.auto_paste = auto_paste
         try:
             os.makedirs(self.copy_dir, exist_ok=True)
         except Exception:
             pass
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
-        self.root.geometry("620x620")
+        self.root.geometry("620x640")
         self.root.protocol("WM_DELETE_WINDOW", self.quit_app)
 
         self.capturing = False
@@ -642,6 +836,14 @@ class MainApp:
         tk.Button(row2, text="连接 Marvis", command=self.open_connect,
                   bg="#1a8cff", fg="white", width=12).pack(side="right")
 
+        # 自动粘贴开关
+        opt = tk.LabelFrame(top, text="自动粘贴", padx=10, pady=6)
+        opt.pack(fill="x", pady=(0, 6))
+        self.var_auto_paste = tk.BooleanVar(value=self.auto_paste)
+        tk.Checkbutton(opt, text="截图后自动粘贴到 Marvis 输入框（开启后无需再说「查看图」或手动 Ctrl+V）",
+                       variable=self.var_auto_paste, command=self.save_auto_paste_option,
+                       anchor="w").pack(fill="x")
+
         # 副本目录设置
         cfg = tk.LabelFrame(top, text="副本目录（截图副本保存位置，可随时修改并持久化）", padx=10, pady=8)
         cfg.pack(fill="x", pady=(0, 6))
@@ -675,7 +877,7 @@ class MainApp:
         # 底部
         foot = tk.Frame(top)
         foot.pack(fill="x", pady=(10, 0))
-        tk.Label(foot, text="截图确认后可对 Marvis 说「查看图0001」或 Ctrl+V 粘贴",
+        tk.Label(foot, text="截图确认后会自动粘贴到 Marvis（可在开关中关闭）",
                  fg="#888888").pack(side="left")
         tk.Button(foot, text="退出", command=self.quit_app, bg="#c9302c", fg="white", width=10).pack(side="right")
 
@@ -685,6 +887,14 @@ class MainApp:
             ConnectWindow(self.root, self.copy_dir, self.last_name)
         except Exception as exc:
             messagebox.showerror("错误", "打开连接窗口失败: %s" % exc, parent=self.root)
+
+    # ---------- 自动粘贴开关 ----------
+    def save_auto_paste_option(self):
+        try:
+            self.auto_paste = self.var_auto_paste.get()
+            save_config(self.copy_dir, self.auto_paste)
+        except Exception as exc:
+            messagebox.showerror("错误", "保存自动粘贴设置失败: %s" % exc, parent=self.root)
 
     # ---------- 副本目录 ----------
     def browse_copy_dir(self):
@@ -705,7 +915,7 @@ class MainApp:
                 messagebox.showwarning("提示", "请输入或选择目录路径", parent=self.root)
                 return
             os.makedirs(d, exist_ok=True)
-            if save_config(d):
+            if save_config(d, self.auto_paste):
                 self.copy_dir = d
                 self.lbl_copy_dir_cur.config(text=d)
                 self.refresh_list()
@@ -819,8 +1029,9 @@ class MainApp:
 
     def _do_capture(self):
         try:
-            img = ImageGrab.grab()
-            CaptureWindow(self.root, img, self.on_capture_done)
+            bbox = get_virtual_screen_bbox()
+            img = ImageGrab.grab(bbox=bbox)
+            CaptureWindow(self.root, img, bbox, self.on_capture_done)
         except Exception as exc:
             self.capturing = False
             try:
@@ -846,9 +1057,23 @@ class MainApp:
         self.last_name = name
         self.lbl_recent.config(text="最近截图：" + name)
         self.refresh_list()
-        tips = "截图已保存并复制到剪贴板！\n\n名称：%s\n\n保存位置：\n%s\n副本：\n%s\n\n现在可以：\n· 直接对 Marvis 说「查看%s」\n· 或在 Marvis 输入框按 Ctrl+V 粘贴" % (name, main_path, copy_path, name)
-        if not copied:
-            tips += "\n\n[提示] 剪贴板复制失败(缺少 pywin32)，请用启动脚本运行。"
+
+        paste_msg = None
+        if copied and self.auto_paste:
+            ok, msg = paste_to_marvis()
+            if ok:
+                paste_msg = "已自动粘贴到 Marvis 输入框，请按回车确认发送"
+            else:
+                paste_msg = "[自动粘贴失败] %s\n\n请回退：对 Marvis 说「查看%s」或手动 Ctrl+V 粘贴" % (msg, name)
+
+        if paste_msg:
+            tips = ("截图已保存！\n\n名称：%s\n\n保存位置：\n%s\n副本：\n%s\n\n%s"
+                    % (name, main_path, copy_path, paste_msg))
+        else:
+            tips = ("截图已保存并复制到剪贴板！\n\n名称：%s\n\n保存位置：\n%s\n副本：\n%s\n\n现在可以：\n· 直接对 Marvis 说「查看%s」\n· 或在 Marvis 输入框按 Ctrl+V 粘贴"
+                    % (name, main_path, copy_path, name))
+            if not copied:
+                tips += "\n\n[提示] 剪贴板复制失败(缺少 pywin32)，请用启动脚本运行。"
         messagebox.showinfo("完成", tips, parent=self.root)
 
     # ---------- 列表与预览 ----------
@@ -914,8 +1139,29 @@ class MainApp:
 
 # ---------------- 自测 ----------------
 def run_selftest():
-    """模拟截图确认流程：使用自定义副本目录验证主图+副本保存与递增命名"""
+    """验证：多屏 bbox 计算、坐标映射、重选状态重置、保存流程、配置默认值"""
+    if sys.stdout is None:
+        # windowed(exe) 下 stdout 为空，结果写入文件供外部校验
+        sys.stdout = open(os.path.join(BASE_DIR, "selftest_result.txt"), "w", encoding="utf-8")
     os.makedirs(SAVE_DIR, exist_ok=True)
+
+    # 1) 多屏 bbox 计算与截图尺寸匹配
+    bbox = get_virtual_screen_bbox()
+    w = bbox[2] - bbox[0]
+    h = bbox[3] - bbox[1]
+    print("SELFTEST VIRTUAL_BBOX:", bbox)
+    print("SELFTEST VIRTUAL_SIZE:", w, h)
+    grab = ImageGrab.grab(bbox=bbox)
+    print("SELFTEST GRAB_SIZE_MATCH:", grab.size == (w, h))
+
+    # 2) 多屏负坐标映射验证
+    test_bbox = (-1920, 0, 0, 1080)
+    sx, sy = image_to_screen(test_bbox, 100, 100)
+    ix, iy = screen_to_image(test_bbox, -1820, 100)
+    print("SELFTEST MAP_SCREEN:", (sx, sy), "expect (-1820, 100)")
+    print("SELFTEST MAP_IMAGE:", (ix, iy), "expect (100, 100)")
+
+    # 3) 保存流程（自定义副本目录 + 递增命名 + 剪贴板）
     test_copy_dir = os.path.join(BASE_DIR, "selftest_copy")
     img = Image.new("RGB", (320, 200), (235, 235, 235))
     d = ImageDraw.Draw(img)
@@ -928,7 +1174,19 @@ def run_selftest():
     print("SELFTEST COPY:", copy_p)
     print("SELFTEST COPY_DIR_OK:", os.path.isdir(test_copy_dir))
     print("SELFTEST CLIPBOARD:", copied)
-    print("SELFTEST CONFIG_DEFAULT:", load_config())
+
+    # 4) 配置默认值
+    copy_dir, auto_paste = load_config()
+    print("SELFTEST CONFIG_DEFAULT:", copy_dir)
+    print("SELFTEST AUTO_PASTE_DEFAULT:", auto_paste)
+
+    # 5) Marvis 窗口查找函数可运行（不粘贴）
+    try:
+        wins = find_marvis_windows()
+        print("SELFTEST MARVIS_WINDOWS:", len(wins), wins[:1])
+    except Exception as e:
+        print("SELFTEST MARVIS_WINDOWS_ERR:", e)
+
     print("SELFTEST DONE")
 
 
@@ -937,12 +1195,12 @@ def main():
     if "--selftest" in sys.argv:
         run_selftest()
         return
-    copy_dir = load_config()
+    copy_dir, auto_paste = load_config()
     try:
         os.makedirs(copy_dir, exist_ok=True)
     except Exception:
         pass
-    app = MainApp(copy_dir)
+    app = MainApp(copy_dir, auto_paste)
     app.mainloop()
 
 
