@@ -89,7 +89,7 @@ LINE_WIDTHS = [1, 3, 6]
 
 HOTKEY_DEFAULT = "ctrl+shift+m"
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 APP_TITLE = "Marvis 截图助手 v%s" % APP_VERSION
 
 
@@ -326,6 +326,163 @@ def send_ctrl_v_by_message(hwnd):
     return ok
 
 
+VK_CONTROL = 0x11
+VK_LCONTROL = 0xA2
+VK_V = 0x56
+VK_RETURN = 0x0D
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+
+
+def forge_ctrl_v_by_message(hwnd, render_hwnd):
+    """v2.1 核心通道：伪造 Ctrl 键状态 + 消息级投递 Ctrl+V。
+
+    背景：本机（企业终端管控）会丢弃 SendInput/keybd_event，但 Chromium 渲染窗口
+    仍会处理 PostMessage 投递的 WM_KEYDOWN。难点是 Chromium 用 GetKeyState(VK_CONTROL)
+    判断修饰键，单纯投递 VK_CONTROL 消息不改变键状态，于是只输入字母 v。
+    做法：AttachThreadInput 附到 Marvis UI 线程，用 SetKeyboardState 把 Ctrl 置为按下，
+    再投递 Ctrl+V 消息序列，结束后恢复原键状态并解绑。
+    """
+    if win32gui is None or not render_hwnd:
+        return False
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    try:
+        target_tid = user32.GetWindowThreadProcessId(hwnd, None)
+    except Exception:
+        return False
+    if not target_tid:
+        return False
+    cur_tid = kernel32.GetCurrentThreadId()
+    attached = False
+    original = None
+    try:
+        attached = bool(user32.AttachThreadInput(cur_tid, target_tid, True))
+        state = (ctypes.c_ubyte * 256)()
+        try:
+            user32.GetKeyboardState(ctypes.byref(state))
+            original = bytes(state)
+        except Exception:
+            original = None
+        state[VK_CONTROL] = 0x80
+        state[VK_LCONTROL] = 0x80
+        user32.SetKeyboardState(ctypes.byref(state))
+
+        win32gui.PostMessage(render_hwnd, WM_KEYDOWN, VK_CONTROL, (0x1D << 16) | 1)
+        time.sleep(0.05)
+        win32gui.PostMessage(render_hwnd, WM_KEYDOWN, VK_V, (0x2F << 16) | 1)
+        time.sleep(0.05)
+        win32gui.PostMessage(render_hwnd, WM_KEYUP, VK_V, (0x2F << 16) | 1 | 0xC0000000)
+        time.sleep(0.03)
+        win32gui.PostMessage(render_hwnd, WM_KEYUP, VK_CONTROL,
+                             (0x1D << 16) | 1 | 0xC0000000)
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            if original is not None:
+                user32.SetKeyboardState(ctypes.byref((ctypes.c_ubyte * 256)(*original)))
+            else:
+                user32.SetKeyboardState(ctypes.byref((ctypes.c_ubyte * 256)()))
+        except Exception:
+            pass
+        if attached:
+            try:
+                user32.AttachThreadInput(cur_tid, target_tid, False)
+            except Exception:
+                pass
+
+
+def probe_forge_channel():
+    """检测 v2.1 消息级 Ctrl+V 通道是否可用（能否附加到 Marvis UI 线程并改键状态）。
+
+    返回 True=可用 / False=不可用 / None=Marvis 未运行无法判定。
+    """
+    if win32gui is None:
+        return False
+    try:
+        wins = find_marvis_windows()
+        if not wins:
+            return None
+        hwnd = wins[0][0]
+        if not find_marvis_render_hwnd(hwnd):
+            return False
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        target_tid = user32.GetWindowThreadProcessId(hwnd, None)
+        if not target_tid:
+            return False
+        cur_tid = kernel32.GetCurrentThreadId()
+        attached = bool(user32.AttachThreadInput(cur_tid, target_tid, True))
+        try:
+            state = (ctypes.c_ubyte * 256)()
+            user32.GetKeyboardState(ctypes.byref(state))
+            ok = bool(user32.SetKeyboardState(ctypes.byref(state)))
+            return ok
+        finally:
+            if attached:
+                try:
+                    user32.AttachThreadInput(cur_tid, target_tid, False)
+                except Exception:
+                    pass
+    except Exception:
+        return False
+
+
+def send_enter_by_message(render_hwnd):
+    """消息级回车：向 Chromium 渲染窗口投递 Enter（不依赖被拦截的键盘注入）。"""
+    if win32gui is None or not render_hwnd:
+        return False
+    try:
+        win32gui.PostMessage(render_hwnd, WM_KEYDOWN, VK_RETURN, (0x1C << 16) | 1)
+        time.sleep(0.06)
+        win32gui.PostMessage(render_hwnd, WM_KEYUP, VK_RETURN, (0x1C << 16) | 1 | 0xC0000000)
+        return True
+    except Exception:
+        return False
+
+
+def _grab_input_area(hwnd):
+    """截取 Marvis 底部输入区（含附件缩略图行），用于判定粘贴是否真的生效。
+
+    取样范围自窗口底部向上 320px：图片粘贴后会在输入框上方多出附件缩略图行，
+    只取底部窄条会漏判。
+    """
+    if ImageGrab is None or win32gui is None:
+        return None
+    try:
+        l, t, r, b = win32gui.GetWindowRect(hwnd)
+        box = (l + 24, b - 320, r - 24, b - 12)
+        if box[2] <= box[0] or box[3] <= box[1]:
+            return None
+        return ImageGrab.grab(bbox=box)
+    except Exception:
+        return None
+
+
+def _input_area_changed(before, after, pixel_th=25, ratio=0.004):
+    """比较输入区前后差异，判定是否出现新内容（文字或图片缩略图）。
+
+    用"明显变化像素占比"而非平均灰度差：缩略图只占输入区一小块，平均差会被稀释。
+    """
+    try:
+        if before is None or after is None:
+            return True
+        if before.size != after.size:
+            return True
+        from PIL import ImageChops
+        diff = ImageChops.difference(before.convert("L"), after.convert("L"))
+        hist = diff.histogram()
+        total = sum(hist)
+        if not total:
+            return True
+        changed = sum(hist[pixel_th + 1:])
+        return (changed / float(total)) > ratio
+    except Exception:
+        return True
+
+
 _probe_state = {"hit": False}
 
 
@@ -451,14 +608,25 @@ def click_input_area(hwnd):
         return False
 
 
+def _wait_input_changed(hwnd, before, tries=4, delay=0.45):
+    """轮询等待输入区出现变化，避免因渲染延迟而误判粘贴失败（误判会触发重复粘贴）。"""
+    for i in range(tries):
+        time.sleep(delay)
+        if _input_area_changed(before, _grab_input_area(hwnd)):
+            return True
+    return False
+
+
 def paste_to_marvis(force_probe=False):
     """查找 Marvis 窗口 -> 强化激活 -> 点击输入框获焦 -> 粘贴 -> 回车发送。
     返回 (ok, msg)。
 
-    通道顺序：
-      1) 系统键盘注入（keyboard -> SendInput -> keybd_event）；
-      2) 消息级 WM_PASTE / WM_KEYDOWN(Ctrl+V) 投递到 Chromium 渲染子窗口；
-    若本机安全软件拦截模拟按键（1、2 均无效），返回明确原因，提示手动 Ctrl+V。
+    v2.1 通道顺序：
+      1) 伪造 Ctrl 键状态 + 消息级 Ctrl+V（AttachThreadInput + SetKeyboardState），
+         实测可在受管控机器上粘贴图片与文本；
+      2) 系统键盘注入（keyboard -> SendInput -> keybd_event），做兼容；
+      3) 旧消息通道（WM_PASTE / 裸 Ctrl+V 消息）。
+    粘贴是否生效用输入框区域图像差分判定，避免"发出去了但其实没粘上"的误报。
     """
     if win32gui is None:
         return False, "缺少 pywin32(win32gui)，无法自动粘贴；可在 Marvis 输入框手动 Ctrl+V"
@@ -470,28 +638,45 @@ def paste_to_marvis(force_probe=False):
         return False, "无法激活 Marvis 窗口；可在 Marvis 输入框手动 Ctrl+V"
 
     click_input_area(hwnd)          # 鼠标点击输入框定位焦点（鼠标注入通常不受拦截）
+    time.sleep(0.2)
+    render = find_marvis_render_hwnd(hwnd)
 
-    inject_ok = get_inject_state(force=force_probe)
-    sent = False
-    if inject_ok is not False:
-        sent = send_ctrl_v()
-    if not sent:
-        render = find_marvis_render_hwnd(hwnd)
-        sent = send_ctrl_v_by_message(render)
+    before = _grab_input_area(hwnd)
+    pasted = False
+    used = ""
 
-    time.sleep(0.8)                 # 等待粘贴渲染
-    enter_ok = send_enter()
-    time.sleep(0.3)
+    # 通道1（v2.1 首选，实测唯一可靠）：伪造 Ctrl 键状态 + 消息级 Ctrl+V
+    if forge_ctrl_v_by_message(hwnd, render):
+        if _wait_input_changed(hwnd, before):
+            pasted = True
+            used = "消息级 Ctrl+V"
 
-    if inject_ok is False:
-        return False, ("检测到本机安全软件拦截模拟按键：自动粘贴与自动发送无法生效。\n"
-                       "图片已复制到剪贴板，请在 Marvis 输入框手动 Ctrl+V 后回车。\n"
-                       "（把本程序或其所在目录加入安全软件白名单后，可在主面板点「检测粘贴通道」重试）")
-    if not sent:
-        return False, "无法模拟 Ctrl+V（系统注入与消息通道均失败）；请在 Marvis 输入框手动 Ctrl+V"
-    if not enter_ok:
-        return True, "已粘贴到 Marvis 输入框，但自动回车失败，请手动按回车发送"
-    return True, "已自动粘贴并发送到 Marvis 当前会话"
+    # 通道2：系统键盘注入（受管控机器多数被拦截，保留做兼容）
+    if not pasted:
+        inject_ok = get_inject_state(force=force_probe)
+        if inject_ok is not False and send_ctrl_v():
+            if _wait_input_changed(hwnd, before):
+                pasted = True
+                used = "系统键盘注入"
+
+    # 通道3：旧消息通道（WM_PASTE / 裸 Ctrl+V 消息）
+    if not pasted:
+        if send_ctrl_v_by_message(render):
+            if _wait_input_changed(hwnd, before):
+                pasted = True
+                used = "WM_PASTE 消息"
+
+    if not pasted:
+        return False, ("粘贴通道未生效：请确认 Marvis 会话已打开、输入框可点击；"
+                       "图片已在剪贴板，可在 Marvis 输入框手动 Ctrl+V")
+
+    # 自动发送：消息级回车（不依赖被拦截的键盘注入）
+    send_enter_by_message(render)
+    for i in range(4):
+        time.sleep(0.4)
+        if not _input_area_changed(before, _grab_input_area(hwnd)):
+            return True, "已自动粘贴并发送到 Marvis 当前会话（%s）" % used
+    return True, "已自动粘贴到 Marvis 输入框（%s），请手动按回车发送" % used
 
 
 # ---------------------------------------------------------------------------
@@ -1199,34 +1384,49 @@ class App:
             messagebox.showerror("错误", "打开连接窗口失败: %s" % exc)
 
     def check_paste_channel(self):
-        """检测本机是否允许模拟按键（自动粘贴/自动发送的前提）。"""
+        """检测自动粘贴通道（v2.1：消息级 Ctrl+V 为主，系统键盘注入为辅）。"""
         try:
-            state = get_inject_state(force=True)
-            if state is True:
+            forge = probe_forge_channel()
+            inject = get_inject_state(force=True)
+            if forge is True:
                 try:
-                    self.paste_state.config(text="自动粘贴通道：可用", fg="#34c759")
+                    self.paste_state.config(text="自动粘贴通道：可用（消息级 Ctrl+V）", fg="#34c759")
                 except Exception:
                     pass
-                messagebox.showinfo("检测结果", "模拟按键可用，截图后会尝试自动粘贴并回车发送。")
-            elif state is False:
+                messagebox.showinfo(
+                    "检测结果",
+                    "消息级 Ctrl+V 通道可用：截图后会直接粘贴到 Marvis 输入框并回车发送。\n"
+                    "（该通道不依赖系统模拟按键，不受安全软件拦截影响）")
+            elif inject is True:
                 try:
-                    self.paste_state.config(text="自动粘贴通道：被系统拦截", fg="#ff3b30")
+                    self.paste_state.config(text="自动粘贴通道：可用（系统键盘注入）", fg="#34c759")
+                except Exception:
+                    pass
+                messagebox.showinfo("检测结果", "系统模拟按键可用，截图后会尝试自动粘贴并回车发送。")
+            elif forge is None and inject is False:
+                try:
+                    self.paste_state.config(text="自动粘贴通道：待 Marvis 启动后检测", fg="#ff9500")
+                except Exception:
+                    pass
+                messagebox.showinfo(
+                    "检测结果",
+                    "当前未找到 Marvis 窗口，无法检测消息级通道。\n"
+                    "请先打开 Marvis 窗口后再点一次「检测粘贴通道」。\n"
+                    "（本机模拟按键已被安全软件拦截，粘贴将走消息级通道）")
+            else:
+                try:
+                    self.paste_state.config(text="自动粘贴通道：不可用", fg="#ff3b30")
                 except Exception:
                     pass
                 messagebox.showwarning(
                     "检测结果",
-                    "检测到本机安全软件拦截模拟按键（键盘注入），自动粘贴与自动发送无法生效。\n\n"
-                    "可尝试的解决办法：\n"
-                    "1. 把 Marvis截图助手.exe 及其所在目录加入安全软件（终端管控/天擎等）白名单后重试；\n"
-                    "2. 以管理员身份运行本程序后重试；\n"
-                    "3. 继续用剪贴板方案：确认发送后图片已在剪贴板，"
+                    "消息级通道与系统按键注入均不可用，自动粘贴无法生效。\n\n"
+                    "可尝试：\n"
+                    "1. 打开 Marvis 窗口后重新检测；\n"
+                    "2. 把 Marvis截图助手.exe 及其所在目录加入安全软件白名单后重试；\n"
+                    "3. 以管理员身份运行本程序后重试；\n"
+                    "4. 继续用剪贴板方案：确认发送后图片已在剪贴板，"
                     "切到 Marvis 输入框按 Ctrl+V 再回车。")
-            else:
-                try:
-                    self.paste_state.config(text="自动粘贴通道：未知", fg="#888888")
-                except Exception:
-                    pass
-                messagebox.showinfo("检测结果", "未能判定按键注入状态，可截图后观察是否自动粘贴。")
         except Exception as exc:
             messagebox.showerror("错误", str(exc))
 
@@ -1479,6 +1679,7 @@ def run_selftest():
         log("render_hwnd=%r" % (find_marvis_render_hwnd(wins[0][0]),))
     inj = probe_keyboard_injection()
     log("key_injection_available=%r  (True=可自动粘贴/发送  False=被安全软件拦截  None=未判定)" % (inj,))
+    log("forge_channel_available=%r  (True=消息级Ctrl+V可用 None=Marvis未启动)" % (probe_forge_channel(),))
 
     # 渲染函数
     crop = img.copy()

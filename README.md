@@ -1,3 +1,14 @@
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 798659b1f59514cb753b383c1f423b09_75fc7ca6d8c611f1a0ca525400de85a5
+    ReservedCode1: 03c5Wv2mS1hrMwMnp70QItKgCFjPKjUpTpZW2DancVnmH3MbfpIImbNUy+AQYNwcZ0Rk+Z1JMvEN+41mWnhDFqguqS5U4eKXDfXO2FM/o1tpJARvtIIbz5HB+Bb9tMNhAZoOHVorJyoQ5B0nyPmxxWI0bzo+eVsZYXjcWQNkHbGyHRNoOX4cTnQPhk4=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 798659b1f59514cb753b383c1f423b09_75fc7ca6d8c611f1a0ca525400de85a5
+    ReservedCode2: 03c5Wv2mS1hrMwMnp70QItKgCFjPKjUpTpZW2DancVnmH3MbfpIImbNUy+AQYNwcZ0Rk+Z1JMvEN+41mWnhDFqguqS5U4eKXDfXO2FM/o1tpJARvtIIbz5HB+Bb9tMNhAZoOHVorJyoQ5B0nyPmxxWI0bzo+eVsZYXjcWQNkHbGyHRNoOX4cTnQPhk4=
+---
+
 # Marvis 截图助手 v2.0
 
 面向 Marvis 用户的常驻桌面截图标注工具（Windows / Python + tkinter + Pillow）。
@@ -53,3 +64,4 @@
 双击 `Marvis截图助手.exe`（或 `启动截图标注.bat`）启动，按 `Ctrl+Shift+M` 截图框选标注，确认后图片进入剪贴板，到 Marvis 输入框 `Ctrl+V` 并回车发送。
 
 自检：`Marvis截图助手.exe --selftest` 或 `python screenshot_annotator.py --selftest`，结果写入 `selftest_result.txt`。
+*（内容由AI生成，仅供参考）*
