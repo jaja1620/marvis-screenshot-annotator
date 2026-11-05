@@ -1,0 +1,11 @@
+# Python 缓存与构建产物
+__pycache__/
+*.pyc
+*.bak*
+build/
+dist/
+*.spec
+
+# 截图数据目录（不入库）
+screenshots/
+MARVIS沟通截图/

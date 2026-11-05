@@ -89,6 +89,9 @@ LINE_WIDTHS = [1, 3, 6]
 
 HOTKEY_DEFAULT = "ctrl+shift+m"
 
+APP_VERSION = "2.0"
+APP_TITLE = "Marvis 截图助手 v%s" % APP_VERSION
+
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -280,6 +283,113 @@ def _sendinput_key(vk, keyup=False):
         return False
 
 
+def find_marvis_render_hwnd(main_hwnd):
+    """找到 Marvis 主窗口下的 Chromium 渲染子窗口（Chrome_RenderWidgetHostHWND）。"""
+    if win32gui is None or not main_hwnd:
+        return None
+    found = []
+
+    def cb(h, _):
+        try:
+            cls = win32gui.GetClassName(h) or ""
+            if "Chrome_RenderWidgetHostHWND" in cls:
+                found.append(h)
+        except Exception:
+            pass
+
+    try:
+        win32gui.EnumChildWindows(main_hwnd, cb, None)
+    except Exception:
+        return None
+    return found[0] if found else None
+
+
+def send_ctrl_v_by_message(hwnd):
+    """消息级粘贴通道：向渲染子窗口投递 WM_PASTE / WM_KEYDOWN(Ctrl+V)。
+    不经过系统键盘注入，理论上可绕开安全软件对模拟按键的拦截。"""
+    if win32gui is None or not hwnd:
+        return False
+    ok = False
+    try:
+        win32gui.SendMessage(hwnd, 0x0302, 0, 0)   # WM_PASTE
+        ok = True
+    except Exception:
+        pass
+    try:
+        win32gui.PostMessage(hwnd, 0x0100, 0x11, (0x1D << 16) | 1)          # CTRL down
+        win32gui.PostMessage(hwnd, 0x0100, 0x56, (0x2F << 16) | 1)          # V down
+        win32gui.PostMessage(hwnd, 0x0101, 0x56, (0x2F << 16) | 1 | 0xC0000000)
+        win32gui.PostMessage(hwnd, 0x0101, 0x11, (0x1D << 16) | 1 | 0xC0000000)
+        ok = True
+    except Exception:
+        pass
+    return ok
+
+
+_probe_state = {"hit": False}
+
+
+def _probe_wndproc(hwnd, msg, wparam, lparam):
+    try:
+        if msg == 0x0100:  # WM_KEYDOWN
+            _probe_state["hit"] = True
+    except Exception:
+        pass
+    return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+
+def probe_keyboard_injection(timeout=0.5):
+    """检测本机是否允许模拟按键。
+    建一个隐藏探针窗口 -> SendInput 一个无害键(VK_DOWN) -> 看是否收到 WM_KEYDOWN。
+    返回 True=可用 / False=被系统拦截 / None=无法判定。
+    """
+    if win32gui is None or win32api is None:
+        return None
+    hwnd = None
+    try:
+        try:
+            wc = win32gui.WNDCLASS()
+            wc.lpszClassName = "MarvisShotInjectProbe"
+            wc.lpfnWndProc = _probe_wndproc
+            wc.hInstance = win32api.GetModuleHandle(None)
+            win32gui.RegisterClass(wc)
+        except Exception:
+            pass
+        hinst = win32api.GetModuleHandle(None)
+        hwnd = win32gui.CreateWindow("MarvisShotInjectProbe", "probe",
+                                     0x80000000, 0, 0, 4, 4, 0, 0, hinst, None)
+        if not hwnd:
+            return None
+        win32gui.ShowWindow(hwnd, 5)      # SW_SHOW（无激活窗口，几乎不可见）
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        try:
+            win32gui.SetFocus(hwnd)
+        except Exception:
+            pass
+        _probe_state["hit"] = False
+        _sendinput_key(0x28)              # VK_DOWN
+        _sendinput_key(0x28, True)
+        deadline = time.time() + timeout
+        while time.time() < deadline and not _probe_state["hit"]:
+            try:
+                win32gui.PumpWaitingMessages()
+            except Exception:
+                break
+            time.sleep(0.02)
+        return bool(_probe_state["hit"])
+    except Exception:
+        return None
+    finally:
+        if hwnd:
+            try:
+                win32gui.DestroyWindow(hwnd)
+            except Exception:
+                pass
+
+
 def send_ctrl_v():
     """发送 Ctrl+V，多级降级：keyboard -> ctypes SendInput -> win32api.keybd_event"""
     if keyboard is not None:
@@ -316,22 +426,71 @@ def send_enter():
     return _sendinput_key(0x0D) and _sendinput_key(0x0D, True)
 
 
-def paste_to_marvis():
-    """查找 Marvis 窗口 -> 强化激活 -> Ctrl+V 粘贴 -> 延时 -> 回车发送。
-    返回 (ok, msg)。"""
+_INJECT_CACHE = {"ok": None}
+
+
+def get_inject_state(force=False):
+    """带缓存的键盘注入可用性检测。True/False/None"""
+    if force or _INJECT_CACHE["ok"] is None:
+        _INJECT_CACHE["ok"] = probe_keyboard_injection()
+    return _INJECT_CACHE["ok"]
+
+
+def click_input_area(hwnd):
+    """鼠标点击 Marvis 窗口底部输入框区域，使输入框获得焦点。"""
+    try:
+        l, t, r, b = win32gui.GetWindowRect(hwnd)
+        user32 = ctypes.windll.user32
+        user32.SetCursorPos((l + r) // 2, b - 62)
+        time.sleep(0.15)
+        user32.mouse_event(0x0002, 0, 0, 0, 0)
+        user32.mouse_event(0x0004, 0, 0, 0, 0)
+        time.sleep(0.2)
+        return True
+    except Exception:
+        return False
+
+
+def paste_to_marvis(force_probe=False):
+    """查找 Marvis 窗口 -> 强化激活 -> 点击输入框获焦 -> 粘贴 -> 回车发送。
+    返回 (ok, msg)。
+
+    通道顺序：
+      1) 系统键盘注入（keyboard -> SendInput -> keybd_event）；
+      2) 消息级 WM_PASTE / WM_KEYDOWN(Ctrl+V) 投递到 Chromium 渲染子窗口；
+    若本机安全软件拦截模拟按键（1、2 均无效），返回明确原因，提示手动 Ctrl+V。
+    """
     if win32gui is None:
-        return False, "缺少 pywin32(win32gui)，无法自动粘贴；可手动在 Marvis 输入框 Ctrl+V"
+        return False, "缺少 pywin32(win32gui)，无法自动粘贴；可在 Marvis 输入框手动 Ctrl+V"
     wins = find_marvis_windows()
     if not wins:
-        return False, "未找到 Marvis 窗口；可手动在 Marvis 输入框 Ctrl+V"
+        return False, "未找到 Marvis 窗口；可在 Marvis 输入框手动 Ctrl+V"
     hwnd = wins[0][0]
     if not activate_window_foreground(hwnd):
-        return False, "无法激活 Marvis 窗口；可手动在 Marvis 输入框 Ctrl+V"
-    if not send_ctrl_v():
-        return False, "无法模拟 Ctrl+V（keyboard/SendInput/win32api 均失败）；可手动 Ctrl+V"
-    time.sleep(0.8)  # 等待粘贴渲染
-    send_enter()
+        return False, "无法激活 Marvis 窗口；可在 Marvis 输入框手动 Ctrl+V"
+
+    click_input_area(hwnd)          # 鼠标点击输入框定位焦点（鼠标注入通常不受拦截）
+
+    inject_ok = get_inject_state(force=force_probe)
+    sent = False
+    if inject_ok is not False:
+        sent = send_ctrl_v()
+    if not sent:
+        render = find_marvis_render_hwnd(hwnd)
+        sent = send_ctrl_v_by_message(render)
+
+    time.sleep(0.8)                 # 等待粘贴渲染
+    enter_ok = send_enter()
     time.sleep(0.3)
+
+    if inject_ok is False:
+        return False, ("检测到本机安全软件拦截模拟按键：自动粘贴与自动发送无法生效。\n"
+                       "图片已复制到剪贴板，请在 Marvis 输入框手动 Ctrl+V 后回车。\n"
+                       "（把本程序或其所在目录加入安全软件白名单后，可在主面板点「检测粘贴通道」重试）")
+    if not sent:
+        return False, "无法模拟 Ctrl+V（系统注入与消息通道均失败）；请在 Marvis 输入框手动 Ctrl+V"
+    if not enter_ok:
+        return True, "已粘贴到 Marvis 输入框，但自动回车失败，请手动按回车发送"
     return True, "已自动粘贴并发送到 Marvis 当前会话"
 
 
@@ -864,6 +1023,54 @@ class EditWindow(tk.Toplevel):
         self.destroy()
 
 
+# ---------------- 连接 Marvis 窗口 ----------------
+class ConnectWindow:
+    """显示副本目录绝对路径 + 使用说明，用于跨电脑部署时和 Marvis 建立连接"""
+
+    def __init__(self, parent, copy_dir, last_name):
+        self.win = tk.Toplevel(parent)
+        self.win.title("连接 Marvis")
+        self.win.geometry("580x420")
+        self.win.resizable(False, False)
+        self.win.transient(parent)
+
+        box = tk.Frame(self.win, padx=18, pady=14)
+        box.pack(fill="both", expand=True)
+
+        tk.Label(box, text="连接 Marvis", font=("Microsoft YaHei UI", 15, "bold")).pack(anchor="w")
+        tk.Label(box, text="让 Marvis 记住你的截图副本目录，之后即可通过「查看图XXXX」直接读取图片",
+                 fg="#888888").pack(anchor="w", pady=(4, 12))
+
+        tk.Label(box, text="当前副本目录（绝对路径）：").pack(anchor="w")
+        tk.Label(box, text=copy_dir, fg="#1a8cff", font=("Microsoft YaHei UI", 11, "bold"),
+                 wraplength=540, justify="left").pack(anchor="w", pady=(2, 4))
+
+        def do_copy():
+            try:
+                self.win.clipboard_clear()
+                self.win.clipboard_append(copy_dir)
+                messagebox.showinfo("已复制", "路径已复制到剪贴板", parent=self.win)
+            except Exception as exc:
+                messagebox.showerror("错误", "复制失败: %s" % exc, parent=self.win)
+
+        tk.Button(box, text="复制路径", command=do_copy, width=12).pack(anchor="w", pady=(0, 12))
+
+        tk.Label(box, text="使用说明：", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
+        tips = (
+            "1. 在 Marvis 对话框发送：\n"
+            "   我的截图副本目录是：<路径>\n\n"
+            "2. Marvis 记住该目录后，即可通过「查看图XXXX」\n"
+            "   直接从该目录读取你的截图。\n\n"
+            "3. 换电脑部署时：把本程序与副本目录一起拷过去，\n"
+            "   在新电脑上打开本窗口、复制路径发给 Marvis 即可重新建立连接。"
+        )
+        tk.Label(box, text=tips, justify="left", anchor="w", fg="#333333").pack(anchor="w", pady=(2, 10))
+
+        tk.Label(box, text="最近一张截图：" + (last_name if last_name else "（暂无）"),
+                 fg="#1a8cff").pack(anchor="w")
+        tk.Button(box, text="关闭", command=self.win.destroy).pack(anchor="e", pady=(8, 0))
+
+
 # ---------------------------------------------------------------------------
 # 主面板
 # ---------------------------------------------------------------------------
@@ -875,8 +1082,8 @@ class App:
         self.current_capture = None  # (full_img, bbox) 保留原始全屏图像
         self.hotkey_id = None
 
-        root.title("Marvis 截图助手")
-        root.geometry("640x620")
+        root.title("Marvis 截图助手 v%s" % APP_VERSION)
+        root.geometry("660x730")
         root.resizable(False, False)
 
         # 顶部
@@ -922,6 +1129,23 @@ class App:
         tk.Label(switch_row, text="(关闭时仅保存+复制剪贴板)", fg="#888888") \
             .pack(side="left", padx=4)
 
+        # 连接 Marvis（跨电脑部署时把副本目录告知 Marvis）
+        conn_row = tk.Frame(root)
+        conn_row.pack(fill="x", padx=10, pady=2)
+        tk.Button(conn_row, text="连接 Marvis", command=self.open_connect,
+                  bg="#1f6fd6", fg="#ffffff", width=12) \
+            .pack(side="left")
+        tk.Label(conn_row, text="换电脑部署时，用它在 Marvis 侧重新登记截图副本目录", fg="#888888") \
+            .pack(side="left", padx=6)
+
+        # 粘贴通道状态（检测本机是否允许模拟按键）
+        chan_row = tk.Frame(root)
+        chan_row.pack(fill="x", padx=10, pady=2)
+        tk.Button(chan_row, text="检测粘贴通道", command=self.check_paste_channel, width=12) \
+            .pack(side="left")
+        self.paste_state = tk.Label(chan_row, text="自动粘贴通道：未检测", fg="#888888")
+        self.paste_state.pack(side="left", padx=6)
+
         # 提示
         tip = tk.Label(root,
                        text="流程：全屏遮罩框选区域 -> 预览编辑窗口标注 -> 确认发送自动粘贴到 Marvis",
@@ -950,6 +1174,61 @@ class App:
             .pack(side="left", padx=2)
 
         self.refresh_list()
+
+    # ---- 连接 Marvis / 粘贴通道 ----
+    def open_connect(self):
+        """打开「连接 Marvis」窗口：显示副本目录绝对路径与使用说明。"""
+        try:
+            last = None
+            try:
+                names = sorted([n for n in os.listdir(SCREENSHOT_DIR) if NAME_RE.match(n)],
+                               reverse=True)
+                if names:
+                    last = names[0]
+            except Exception:
+                pass
+            copy_dir = ""
+            try:
+                copy_dir = self.copy_dir_var.get().strip()
+            except Exception:
+                copy_dir = ""
+            if not copy_dir:
+                copy_dir = self.cfg.get("copy_dir", DEFAULT_COPY_DIR)
+            ConnectWindow(self.root, copy_dir, last)
+        except Exception as exc:
+            messagebox.showerror("错误", "打开连接窗口失败: %s" % exc)
+
+    def check_paste_channel(self):
+        """检测本机是否允许模拟按键（自动粘贴/自动发送的前提）。"""
+        try:
+            state = get_inject_state(force=True)
+            if state is True:
+                try:
+                    self.paste_state.config(text="自动粘贴通道：可用", fg="#34c759")
+                except Exception:
+                    pass
+                messagebox.showinfo("检测结果", "模拟按键可用，截图后会尝试自动粘贴并回车发送。")
+            elif state is False:
+                try:
+                    self.paste_state.config(text="自动粘贴通道：被系统拦截", fg="#ff3b30")
+                except Exception:
+                    pass
+                messagebox.showwarning(
+                    "检测结果",
+                    "检测到本机安全软件拦截模拟按键（键盘注入），自动粘贴与自动发送无法生效。\n\n"
+                    "可尝试的解决办法：\n"
+                    "1. 把 Marvis截图助手.exe 及其所在目录加入安全软件（终端管控/天擎等）白名单后重试；\n"
+                    "2. 以管理员身份运行本程序后重试；\n"
+                    "3. 继续用剪贴板方案：确认发送后图片已在剪贴板，"
+                    "切到 Marvis 输入框按 Ctrl+V 再回车。")
+            else:
+                try:
+                    self.paste_state.config(text="自动粘贴通道：未知", fg="#888888")
+                except Exception:
+                    pass
+                messagebox.showinfo("检测结果", "未能判定按键注入状态，可截图后观察是否自动粘贴。")
+        except Exception as exc:
+            messagebox.showerror("错误", str(exc))
 
     # ---- 历史截图 ----
     def refresh_list(self):
@@ -1193,6 +1472,13 @@ def run_selftest():
     wins = find_marvis_windows()
     log("find_marvis_windows count=%d wins=%r" % (len(wins), wins[:3]))
     log("find_ok=%s" % (len(wins) >= 0))
+
+    # 版本 + 渲染子窗口 + 模拟按键可用性（后者会短暂创建并抢焦一个隐藏探针窗口）
+    log("version=%s" % APP_VERSION)
+    if wins:
+        log("render_hwnd=%r" % (find_marvis_render_hwnd(wins[0][0]),))
+    inj = probe_keyboard_injection()
+    log("key_injection_available=%r  (True=可自动粘贴/发送  False=被安全软件拦截  None=未判定)" % (inj,))
 
     # 渲染函数
     crop = img.copy()
